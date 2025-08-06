@@ -75,6 +75,7 @@ class TranscriptionOptions:
     length_penalty: float
     repetition_penalty: float
     no_repeat_ngram_size: int
+    max_repetition: Optional[int]
     log_prob_threshold: Optional[float]
     no_speech_threshold: Optional[float]
     compression_ratio_threshold: Optional[float]
@@ -106,6 +107,25 @@ class TranscriptionInfo:
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
+
+
+def _truncate_repetition(tokens: List[int], max_repetition: int) -> List[int]:
+    """Remove trailing repeated token patterns."""
+    if max_repetition is None or max_repetition < 2:
+        return tokens
+    max_pattern = len(tokens) // max_repetition
+    for pattern_len in range(1, max_pattern + 1):
+        pattern = tokens[-pattern_len:]
+        count = 0
+        while (
+            len(tokens) - (count + 1) * pattern_len >= 0
+            and tokens[-(count + 1) * pattern_len : len(tokens) - count * pattern_len]
+            == pattern
+        ):
+            count += 1
+        if count >= max_repetition:
+            return tokens[: len(tokens) - count * pattern_len]
+    return tokens
 
 
 class BatchedInferencePipeline:
@@ -237,15 +257,16 @@ class BatchedInferencePipeline:
 
         output = []
         for result in results:
-            # return scores
-            seq_len = len(result.sequences_ids[0])
+            tokens = _truncate_repetition(result.sequences_ids[0], options.max_repetition)
+            result.sequences_ids[0] = tokens
+            seq_len = len(tokens)
             cum_logprob = result.scores[0] * (seq_len**options.length_penalty)
 
             output.append(
                 dict(
                     avg_logprob=cum_logprob / (seq_len + 1),
                     no_speech_prob=result.no_speech_prob,
-                    tokens=result.sequences_ids[0],
+                    tokens=tokens,
                 )
             )
 
@@ -263,6 +284,7 @@ class BatchedInferencePipeline:
         length_penalty: float = 1,
         repetition_penalty: float = 1,
         no_repeat_ngram_size: int = 0,
+        max_repetition: Optional[int] = None,
         temperature: Union[float, List[float], Tuple[float, ...]] = [
             0.0,
             0.2,
@@ -313,6 +335,7 @@ class BatchedInferencePipeline:
             repetition_penalty: Penalty applied to the score of previously generated tokens
                 (set > 1 to penalize).
             no_repeat_ngram_size: Prevent repetitions of ngrams with this size (set 0 to disable).
+            max_repetition: Stop generating when any token sequence is repeated this many times.
             temperature: Temperature for sampling. If a list or tuple is passed,
                 only the first value is used.
             initial_prompt: Optional text string or iterable of token ids to provide as a
@@ -499,6 +522,7 @@ class BatchedInferencePipeline:
             length_penalty=length_penalty,
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
+            max_repetition=max_repetition,
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
@@ -730,6 +754,7 @@ class WhisperModel:
         length_penalty: float = 1,
         repetition_penalty: float = 1,
         no_repeat_ngram_size: int = 0,
+        max_repetition: Optional[int] = None,
         temperature: Union[float, List[float], Tuple[float, ...]] = [
             0.0,
             0.2,
@@ -779,6 +804,7 @@ class WhisperModel:
           repetition_penalty: Penalty applied to the score of previously generated tokens
             (set > 1 to penalize).
           no_repeat_ngram_size: Prevent repetitions of ngrams with this size (set 0 to disable).
+          max_repetition: Stop generating when any token sequence is repeated this many times.
           temperature: Temperature for sampling. It can be a tuple of temperatures,
             which will be successively used upon failures according to either
             `compression_ratio_threshold` or `log_prob_threshold`.
@@ -948,6 +974,7 @@ class WhisperModel:
             length_penalty=length_penalty,
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
+            max_repetition=max_repetition,
             log_prob_threshold=log_prob_threshold,
             no_speech_threshold=no_speech_threshold,
             compression_ratio_threshold=compression_ratio_threshold,
@@ -1433,6 +1460,8 @@ class WhisperModel:
             )[0]
 
             tokens = result.sequences_ids[0]
+            tokens = _truncate_repetition(tokens, options.max_repetition)
+            result.sequences_ids[0] = tokens
 
             # Recover the average log prob from the returned score.
             seq_len = len(tokens)
