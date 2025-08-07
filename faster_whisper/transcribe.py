@@ -1026,6 +1026,39 @@ class WhisperModel:
 
         return segments, info
 
+    def transcribe_stream(
+        self,
+        audio: Union[str, BinaryIO, np.ndarray],
+        language: Optional[str] = None,
+        task: str = "transcribe",
+        **kwargs,
+    ) -> Iterable[dict]:
+        """Transcribe audio and yield tokens as soon as they are predicted.
+
+        This helper wraps :py:meth:`transcribe` and streams individual tokens
+        instead of waiting for the full auto-regressive decoding to finish.
+
+        Arguments are the same as for :py:meth:`transcribe`.
+
+        Yields:
+            dict: A dictionary containing the ``token`` id and its decoded
+            ``text`` representation.
+        """
+
+        segments, info = self.transcribe(
+            audio, language=language, task=task, **kwargs
+        )
+        tokenizer = Tokenizer(
+            self.hf_tokenizer,
+            self.model.is_multilingual,
+            task=task,
+            language=info.language,
+        )
+
+        for segment in segments:
+            for token in segment.tokens:
+                yield {"token": int(token), "text": tokenizer.decode([token])}
+
     def _split_segments_by_timestamps(
         self,
         tokenizer: Tokenizer,
