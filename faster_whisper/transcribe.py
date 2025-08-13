@@ -96,6 +96,8 @@ class TranscriptionOptions:
     clip_timestamps: Union[str, List[float]]
     hallucination_silence_threshold: Optional[float]
     hotwords: Optional[str]
+    previous_token_range: Optional[int]
+    max_repetition: Optional[int]
 
 
 @dataclass
@@ -107,6 +109,24 @@ class TranscriptionInfo:
     all_language_probs: Optional[List[Tuple[str, float]]]
     transcription_options: TranscriptionOptions
     vad_options: VadOptions
+
+def _truncate_repetition(tokens: List[int], max_repetition: int) -> List[int]:
+    """Remove trailing repeated token patterns."""
+    if max_repetition is None or max_repetition < 2:
+        return tokens
+    max_pattern = len(tokens) // max_repetition
+    for pattern_len in range(1, max_pattern + 1):
+        pattern = tokens[-pattern_len:]
+        count = 0
+        while (
+            len(tokens) - (count + 1) * pattern_len >= 0
+            and tokens[-(count + 1) * pattern_len : len(tokens) - count * pattern_len]
+            == pattern
+        ):
+            count += 1
+        if count >= max_repetition:
+            return tokens[: len(tokens) - count * pattern_len]
+    return tokens
 
 
 def _truncate_repetition(tokens: List[int], max_repetition: int) -> List[int]:
@@ -318,6 +338,8 @@ class BatchedInferencePipeline:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        previous_token_range: Optional[int] = 0,
+        max_repetition: Optional[int] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -551,6 +573,7 @@ class BatchedInferencePipeline:
             multilingual=multilingual,
             without_timestamps=without_timestamps,
             max_initial_timestamp=0.0,
+            previous_token_range = previous_token_range,
         )
 
         info = TranscriptionInfo(
@@ -787,6 +810,8 @@ class WhisperModel:
         hotwords: Optional[str] = None,
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
+        previous_token_range: Optional[int] = 0,
+        max_repetition: Optional[int] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -1001,6 +1026,8 @@ class WhisperModel:
             clip_timestamps=clip_timestamps,
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
+            previous_token_range = previous_token_range,
+            max_repetition=max_repetition,
         )
 
         segments = self.generate_segments(
@@ -1021,6 +1048,39 @@ class WhisperModel:
         )
 
         return segments, info
+
+    def transcribe_stream(
+        self,
+        audio: Union[str, BinaryIO, np.ndarray],
+        language: Optional[str] = None,
+        task: str = "transcribe",
+        **kwargs,
+    ) -> Iterable[dict]:
+        """Transcribe audio and yield tokens as soon as they are predicted.
+
+        This helper wraps :py:meth:`transcribe` and streams individual tokens
+        instead of waiting for the full auto-regressive decoding to finish.
+
+        Arguments are the same as for :py:meth:`transcribe`.
+
+        Yields:
+            dict: A dictionary containing the ``token`` id and its decoded
+            ``text`` representation.
+        """
+
+        segments, info = self.transcribe(
+            audio, language=language, task=task, **kwargs
+        )
+        tokenizer = Tokenizer(
+            self.hf_tokenizer,
+            self.model.is_multilingual,
+            task=task,
+            language=info.language,
+        )
+
+        for segment in segments:
+            for token in segment.tokens:
+                yield {"token": int(token), "text": tokenizer.decode([token])}
 
     def _split_segments_by_timestamps(
         self,
@@ -1382,6 +1442,9 @@ class WhisperModel:
                     )
 
                 prompt_reset_since = len(all_tokens)
+                if options.previous_token_range > 0:
+                    prev_range = min(len(all_tokens), options.previous_token_range)
+                    prompt_reset_since -= prev_range
 
             pbar.update(
                 (min(content_frames, seek) - previous_seek)
