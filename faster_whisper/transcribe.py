@@ -1068,6 +1068,8 @@ class WhisperModel:
             ``text`` representation.
         """
 
+        max_repetition = kwargs.get("max_repetition")
+
         segments, info = self.transcribe(
             audio, language=language, task=task, **kwargs
         )
@@ -1079,8 +1081,19 @@ class WhisperModel:
         )
 
         for segment in segments:
-            for token in segment.tokens:
+            tokens = segment.tokens
+            truncated = False
+
+            if max_repetition is not None:
+                new_tokens = _truncate_repetition(tokens, max_repetition)
+                truncated = len(new_tokens) < len(tokens)
+                tokens = new_tokens
+
+            for token in tokens:
                 yield {"token": int(token), "text": tokenizer.decode([token])}
+
+            if truncated:
+                break
 
     def _split_segments_by_timestamps(
         self,
