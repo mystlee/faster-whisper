@@ -339,7 +339,6 @@ class BatchedInferencePipeline:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         previous_token_range: Optional[int] = 0,
-        max_repetition: Optional[int] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """transcribe audio in chunks in batched fashion and return with language info.
 
@@ -811,7 +810,6 @@ class WhisperModel:
         language_detection_threshold: Optional[float] = 0.5,
         language_detection_segments: int = 1,
         previous_token_range: Optional[int] = 0,
-        max_repetition: Optional[int] = None,
     ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
         """Transcribes an input file.
 
@@ -1027,7 +1025,6 @@ class WhisperModel:
             hallucination_silence_threshold=hallucination_silence_threshold,
             hotwords=hotwords,
             previous_token_range = previous_token_range,
-            max_repetition=max_repetition,
         )
 
         segments = self.generate_segments(
@@ -1055,42 +1052,122 @@ class WhisperModel:
         language: Optional[str] = None,
         task: str = "transcribe",
         **kwargs,
-    ) -> Iterable[dict]:
-        """Transcribe audio and yield tokens as soon as they are predicted.
+    ) -> Iterable[Segment]:
+        """Transcribe audio and yield segments as soon as they are produced.
 
-        This helper wraps :py:meth:`transcribe` and streams individual tokens
-        instead of waiting for the full auto-regressive decoding to finish.
+        This is a streaming variant of :py:meth:`transcribe` that directly
+        relies on :py:meth:`generate_segments` to decode audio and stream the
+        resulting :class:`Segment` objects auto-regressively.
 
         Arguments are the same as for :py:meth:`transcribe`.
 
         Yields:
-            dict: A dictionary containing the ``token`` id and its decoded
-            ``text`` representation.
+            Segment: a transcription segment yielded immediately after it is
+            generated.
         """
 
-        max_repetition = kwargs.get("max_repetition")
+        if not isinstance(audio, np.ndarray):
+            audio = decode_audio(audio, sampling_rate=self.feature_extractor.sampling_rate)
 
-        segments, info = self.transcribe(
-            audio, language=language, task=task, **kwargs
-        )
+        clip_timestamps = kwargs.get("clip_timestamps", "0")
+        chunk_length = kwargs.get("chunk_length")
+
+        features = self.feature_extractor(audio, chunk_length=chunk_length)
+
+        multilingual = kwargs.get("multilingual", False)
+        if multilingual and not self.model.is_multilingual:
+            self.logger.warning(
+                "The current model is English-only but the multilingual parameter is set to True; setting to False instead."
+            )
+            multilingual = False
+
+        language_detection_threshold = kwargs.get("language_detection_threshold", 0.5)
+        language_detection_segments = kwargs.get("language_detection_segments", 1)
+
+        if language is None:
+            if not self.model.is_multilingual:
+                language = "en"
+            else:
+                language, _, _ = self.detect_language(
+                    features=features,
+                    language_detection_segments=language_detection_segments,
+                    language_detection_threshold=language_detection_threshold,
+                )
+        else:
+            if not self.model.is_multilingual and language != "en":
+                self.logger.warning(
+                    "The current model is English-only but the language parameter is set to '%s'; using 'en' instead."
+                    % language
+                )
+                language = "en"
+
         tokenizer = Tokenizer(
             self.hf_tokenizer,
             self.model.is_multilingual,
             task=task,
-            language=info.language,
+            language=language,
         )
 
+        temperature = kwargs.get(
+            "temperature",
+            [0.0, 0.2, 0.4, 0.6, 0.8, 1.0],
+        )
+        if not isinstance(temperature, (list, tuple)):
+            temperature = [temperature]
+
+        suppress_tokens = kwargs.get("suppress_tokens", [-1])
+        if suppress_tokens:
+            suppress_tokens = get_suppressed_tokens(tokenizer, suppress_tokens)
+
+        options = TranscriptionOptions(
+            beam_size=kwargs.get("beam_size", 5),
+            best_of=kwargs.get("best_of", 5),
+            patience=kwargs.get("patience", 1),
+            length_penalty=kwargs.get("length_penalty", 1),
+            repetition_penalty=kwargs.get("repetition_penalty", 1),
+            no_repeat_ngram_size=kwargs.get("no_repeat_ngram_size", 0),
+            max_repetition=kwargs.get("max_repetition"),
+            log_prob_threshold=kwargs.get("log_prob_threshold", -1.0),
+            no_speech_threshold=kwargs.get("no_speech_threshold", 0.6),
+            compression_ratio_threshold=kwargs.get("compression_ratio_threshold", 2.4),
+            condition_on_previous_text=kwargs.get("condition_on_previous_text", True),
+            prompt_reset_on_temperature=kwargs.get("prompt_reset_on_temperature", 0.5),
+            temperatures=temperature,
+            initial_prompt=kwargs.get("initial_prompt"),
+            prefix=kwargs.get("prefix"),
+            suppress_blank=kwargs.get("suppress_blank", True),
+            suppress_tokens=suppress_tokens,
+            without_timestamps=kwargs.get("without_timestamps", False),
+            max_initial_timestamp=kwargs.get("max_initial_timestamp", 1.0),
+            word_timestamps=kwargs.get("word_timestamps", False),
+            prepend_punctuations=kwargs.get("prepend_punctuations", "\"'“¿([{-"),
+            append_punctuations=kwargs.get("append_punctuations", "\"'.。,，!！?？:：”)]}、"),
+            multilingual=multilingual,
+            max_new_tokens=kwargs.get("max_new_tokens"),
+            clip_timestamps=clip_timestamps,
+            hallucination_silence_threshold=kwargs.get("hallucination_silence_threshold"),
+            hotwords=kwargs.get("hotwords"),
+            previous_token_range=kwargs.get("previous_token_range"),
+        )
+
+        log_progress = kwargs.get("log_progress", False)
+        encoder_output = None
+
+        segments = self.generate_segments(
+            features, tokenizer, options, log_progress, encoder_output
+        )
+
+        max_repetition = kwargs.get("max_repetition")
+
         for segment in segments:
-            tokens = segment.tokens
             truncated = False
-
             if max_repetition is not None:
-                new_tokens = _truncate_repetition(tokens, max_repetition)
-                truncated = len(new_tokens) < len(tokens)
-                tokens = new_tokens
+                new_tokens = _truncate_repetition(segment.tokens, max_repetition)
+                truncated = len(new_tokens) < len(segment.tokens)
+                segment.tokens = new_tokens
+                segment.text = tokenizer.decode(new_tokens)
 
-            for token in tokens:
-                yield {"token": int(token), "text": tokenizer.decode([token])}
+            yield segment
 
             if truncated:
                 break
